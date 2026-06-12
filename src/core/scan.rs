@@ -155,8 +155,12 @@ pub fn diff_file(
         return Ok(FileDiff::placeholder(rel.to_path_buf(), kind, diff_kind));
     }
 
-    let old_text = old.as_deref().map(|b| String::from_utf8_lossy(b).into_owned());
-    let new_text = new.as_deref().map(|b| String::from_utf8_lossy(b).into_owned());
+    let old_text = old
+        .as_deref()
+        .map(|b| diff::sanitize_text(&String::from_utf8_lossy(b)));
+    let new_text = new
+        .as_deref()
+        .map(|b| diff::sanitize_text(&String::from_utf8_lossy(b)));
     let hunks = diff::compute_hunks(
         old_text.as_deref().unwrap_or_default(),
         new_text.as_deref().unwrap_or_default(),
@@ -236,6 +240,39 @@ mod tests {
         assert_eq!(by.get("b.txt"), Some(&ChangeKind::Added));
         assert_eq!(by.get("d.txt"), Some(&ChangeKind::Deleted));
         assert!(!by.contains_key("c.txt"), "unchanged file must be skipped");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn diff_file_sanitizes_tabs_and_control_chars() {
+        let root = temp_root();
+        // Tab-indented JSON with CRLF line endings, like a VS Code tasks.json.
+        write(&root, "tasks.json", "{\r\n\t\"type\": \"shell\",\r\n\t\"group\": {\r\n\t\t\"kind\": \"build\"\r\n\t}\r\n}\r\n");
+        let base = MapBaseline(HashMap::new());
+
+        let fd = diff_file(
+            &root,
+            &base,
+            Path::new("tasks.json"),
+            ChangeKind::Added,
+            &ScanConfig::default(),
+        )
+        .unwrap();
+
+        let rendered: String = fd
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .map(|l| l.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains('\t'), "tabs must be expanded: {rendered:?}");
+        assert!(!rendered.contains('\r'), "CR must be stripped: {rendered:?}");
+        assert!(rendered.contains("        \"kind\""), "tabs become spaces");
+        // The highlight source texts must be sanitized identically.
+        assert!(!fd.new_text.as_ref().unwrap().contains('\t'));
+        assert!(!fd.new_text.as_ref().unwrap().contains('\r'));
 
         std::fs::remove_dir_all(&root).ok();
     }

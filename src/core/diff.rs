@@ -14,6 +14,24 @@ pub fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SNIFF_LEN).any(|&b| b == 0)
 }
 
+/// Make text safe for terminal rendering. Ratatui must never see control
+/// characters: a literal tab moves the real cursor to the next tab stop while
+/// the render buffer assumes one cell, desynchronizing the two and leaving
+/// ghost artifacts on screen. Tabs become spaces; other control characters
+/// (except newline) are dropped, which also normalizes CRLF to LF.
+pub fn sanitize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\t' => out.push_str("    "),
+            '\n' => out.push(ch),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Decide how a pair of (optional) contents should be diffed.
 pub fn classify(old: Option<&[u8]>, new: Option<&[u8]>, size_cap: u64) -> DiffKind {
     let over_cap = |b: Option<&[u8]>| b.is_some_and(|b| b.len() as u64 > size_cap);

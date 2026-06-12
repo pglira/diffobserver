@@ -1,0 +1,17 @@
+[package]
+name = "diffobserver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+dirs = "6.0.0"
+gix = "0.84.0"
+ignore = "0.4.26"
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
+ratatui = "0.29"
+serde = { version = "1.0.228", features = ["derive"] }
+similar = { version = "3.1.1", features = ["inline", "unicode"] }
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+toml = "1.1.2"

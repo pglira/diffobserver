@@ -5,8 +5,6 @@ pub mod highlight;
 pub mod theme;
 pub mod tree;
 
-use std::time::Duration;
-
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -14,8 +12,6 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Focus, Overlay};
-
-const TOAST_TTL: Duration = Duration::from_secs(5);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -137,11 +133,8 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let bar = Style::default().fg(Color::Black).bg(Color::Cyan);
     f.render_widget(Paragraph::new(left).style(bar), area);
 
-    let toast = app
-        .toast
-        .as_ref()
-        .filter(|(_, t)| t.elapsed() < TOAST_TTL)
-        .map(|(m, _)| m.clone());
+    // Expiry is handled by App::tick(); anything still present is shown.
+    let toast = app.toast.as_ref().map(|(m, _)| m.clone());
     let (right_text, right_style) = match toast {
         Some(m) => (
             format!(" {m} "),
@@ -276,7 +269,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 fn centered_rect_abs(percent_x: u16, height: u16, area: Rect) -> Rect {
     let h = height.min(area.height);
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let w = area.width * percent_x / 100;
+    // u32 intermediate: width * percent overflows u16 on ultrawide terminals.
+    let w = (u32::from(area.width) * u32::from(percent_x) / 100) as u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     Rect {
         x,

@@ -32,25 +32,30 @@ impl Highlighter {
         }
     }
 
-    /// Highlight `text` using the language inferred from `path`. Returns, per
-    /// line, the list of `(foreground, substring)` spans (newline stripped).
-    pub fn highlight(&self, path: &Path, text: &str) -> Vec<Vec<(Color, String)>> {
+    /// Highlight `text` using the language inferred from `path`, producing at
+    /// most `max_lines` lines. Syntect must parse from the start of the file
+    /// for correct grammar state, but stopping at the last line a diff
+    /// actually displays avoids paying for the rest of a large file.
+    ///
+    /// Returns, per line, the list of `(foreground, substring)` spans
+    /// (newline stripped).
+    pub fn highlight(
+        &self,
+        path: &Path,
+        text: &str,
+        max_lines: usize,
+    ) -> Vec<Vec<(Color, String)>> {
         if !self.enabled {
             return text
                 .lines()
+                .take(max_lines)
                 .map(|l| vec![(Color::Reset, l.to_string())])
                 .collect();
         }
-        let syntax = self
-            .syntaxes
-            .find_syntax_for_file(path)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
-
+        let syntax = self.find_syntax(path, text);
         let mut hl = HighlightLines::new(syntax, &self.theme);
         let mut out = Vec::new();
-        for line in LinesWithEndings::from(text) {
+        for line in LinesWithEndings::from(text).take(max_lines) {
             let spans = match hl.highlight_line(line, &self.syntaxes) {
                 Ok(ranges) => ranges
                     .into_iter()
@@ -62,6 +67,30 @@ impl Highlighter {
             out.push(spans);
         }
         out
+    }
+
+    /// Infer the syntax from the path's extension or file name, falling back
+    /// to first-line detection (shebangs etc.). Deliberately avoids
+    /// `find_syntax_for_file`: it reads from the filesystem relative to the
+    /// process cwd, which is wrong for repo-relative paths and for deleted
+    /// files.
+    fn find_syntax(&self, path: &Path, text: &str) -> &syntect::parsing::SyntaxReference {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .and_then(|e| self.syntaxes.find_syntax_by_extension(e))
+            .or_else(|| {
+                // Extension-less names like "Makefile" are registered as
+                // "extensions" in syntect's metadata.
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| self.syntaxes.find_syntax_by_extension(n))
+            })
+            .or_else(|| {
+                text.lines()
+                    .next()
+                    .and_then(|l| self.syntaxes.find_syntax_by_first_line(l))
+            })
+            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text())
     }
 }
 

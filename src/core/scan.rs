@@ -1,5 +1,9 @@
 //! Scan the working tree against a baseline to produce the changed-file set,
 //! and compute the full diff for a single file on demand.
+//!
+//! Robustness rules: a scan must survive anything a single file can do —
+//! vanish mid-scan, be unreadable, be huge. Per-file problems degrade to a
+//! per-file status; they never abort the scan.
 
 use std::collections::BTreeSet;
 use std::io::ErrorKind;
@@ -35,12 +39,6 @@ fn read_live(root: &Path, rel: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn to_text(bytes: Option<&[u8]>) -> String {
-    bytes
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default()
-}
-
 /// Compare the live tree at `root` to `base`, returning one entry per change.
 pub fn scan(
     root: &Path,
@@ -58,77 +56,109 @@ pub fn scan(
             (true, true) => ChangeKind::Modified,
             (false, false) => continue,
         };
-        if let Some(change) = classify(root, base, rel, kind, cfg)? {
+        if let Some(change) = classify(root, base, rel, kind, cfg) {
             changes.push(change);
         }
     }
     Ok(changes)
 }
 
-/// Re-scan a specific set of paths (used for incremental updates). Returns the
-/// change entry for each path, or `None` where the path is no longer changed.
-pub fn scan_paths(
-    root: &Path,
-    base: &dyn BaselineSource,
-    rels: &[PathBuf],
-    cfg: &ScanConfig,
-) -> Result<Vec<(PathBuf, Option<FileChange>)>> {
-    let mut out = Vec::with_capacity(rels.len());
-    for rel in rels {
-        let in_live = root.join(rel).exists();
-        let in_base = base.content(rel)?.is_some();
-        let kind = match (in_base, in_live) {
-            (false, true) => Some(ChangeKind::Added),
-            (true, false) => Some(ChangeKind::Deleted),
-            (true, true) => Some(ChangeKind::Modified),
-            (false, false) => None,
-        };
-        let change = match kind {
-            Some(k) => classify(root, base, rel, k, cfg)?,
-            None => None,
-        };
-        out.push((rel.clone(), change));
-    }
-    Ok(out)
-}
-
-/// Build a `FileChange` summary, returning `None` if the file is unchanged.
+/// Build a `FileChange` summary, returning `None` if the file is unchanged
+/// (or vanished). Per-file IO errors degrade to `DiffKind::Unreadable`.
 fn classify(
     root: &Path,
     base: &dyn BaselineSource,
     rel: &Path,
     kind: ChangeKind,
     cfg: &ScanConfig,
-) -> Result<Option<FileChange>> {
+) -> Option<FileChange> {
+    let live_path = root.join(rel);
+
+    // Cheap metadata quick-check (rsync semantics): skip content reads when
+    // the baseline can prove the file is unchanged.
+    if kind == ChangeKind::Modified && base.quick_unchanged(&live_path, rel) {
+        return None;
+    }
+
+    // Size short-circuit BEFORE reading, so a multi-GB artifact is never
+    // slurped into memory just to be declared too large.
+    let live_len = (kind != ChangeKind::Deleted)
+        .then(|| std::fs::metadata(&live_path).ok().map(|m| m.len()))
+        .flatten();
+    let base_len = (kind != ChangeKind::Added)
+        .then(|| base.size(rel))
+        .flatten();
+    if live_len.is_some_and(|l| l > cfg.size_cap) || base_len.is_some_and(|l| l > cfg.size_cap) {
+        return Some(FileChange {
+            path: rel.to_path_buf(),
+            kind,
+            diff_kind: DiffKind::TooLarge,
+            added: 0,
+            removed: 0,
+        });
+    }
+
+    let unreadable = || {
+        Some(FileChange {
+            path: rel.to_path_buf(),
+            kind,
+            diff_kind: DiffKind::Unreadable,
+            added: 0,
+            removed: 0,
+        })
+    };
     let old = if kind == ChangeKind::Added {
         None
     } else {
-        base.content(rel)?
+        match base.content(rel) {
+            Ok(b) => b,
+            Err(_) => return unreadable(),
+        }
     };
     let new = if kind == ChangeKind::Deleted {
         None
     } else {
-        read_live(root, rel)?
+        match read_live(root, rel) {
+            Ok(b) => b,
+            Err(_) => return unreadable(),
+        }
     };
 
-    if kind == ChangeKind::Modified && old.as_deref() == new.as_deref() {
-        return Ok(None);
+    // Files that vanished between the walk and the read.
+    let kind = match (kind, &old, &new) {
+        (ChangeKind::Added, _, None) => return None,
+        (ChangeKind::Deleted, None, _) => return None,
+        (ChangeKind::Modified, _, None) => ChangeKind::Deleted,
+        (ChangeKind::Modified, None, _) => ChangeKind::Added,
+        (k, _, _) => k,
+    };
+
+    if kind == ChangeKind::Modified && old == new {
+        return None;
     }
 
     let diff_kind = diff::classify(old.as_deref(), new.as_deref(), cfg.size_cap);
     let (added, removed) = if diff_kind == DiffKind::Text {
-        diff::count_lines(&to_text(old.as_deref()), &to_text(new.as_deref()))
+        // Sanitize before counting so the tree counts agree with the diff
+        // pane (which renders sanitized text). A CRLF-only or control-char-
+        // only change is not a textual change at all.
+        let old_text = diff::sanitize_text(&String::from_utf8_lossy(old.as_deref().unwrap_or(b"")));
+        let new_text = diff::sanitize_text(&String::from_utf8_lossy(new.as_deref().unwrap_or(b"")));
+        if kind == ChangeKind::Modified && old_text == new_text {
+            return None;
+        }
+        diff::count_lines(&old_text, &new_text)
     } else {
         (0, 0)
     };
 
-    Ok(Some(FileChange {
+    Some(FileChange {
         path: rel.to_path_buf(),
         kind,
         diff_kind,
         added,
         removed,
-    }))
+    })
 }
 
 /// Compute the full diff (hunks + texts) for a single file.
@@ -139,15 +169,50 @@ pub fn diff_file(
     kind: ChangeKind,
     cfg: &ScanConfig,
 ) -> Result<FileDiff> {
+    let live_path = root.join(rel);
+
+    // Same metadata short-circuit as the scan: never read past the cap.
+    let live_len = (kind != ChangeKind::Deleted)
+        .then(|| std::fs::metadata(&live_path).ok().map(|m| m.len()))
+        .flatten();
+    let base_len = (kind != ChangeKind::Added)
+        .then(|| base.size(rel))
+        .flatten();
+    if live_len.is_some_and(|l| l > cfg.size_cap) || base_len.is_some_and(|l| l > cfg.size_cap) {
+        return Ok(FileDiff::placeholder(
+            rel.to_path_buf(),
+            kind,
+            DiffKind::TooLarge,
+        ));
+    }
+
     let old = if kind == ChangeKind::Added {
         None
     } else {
-        base.content(rel)?
+        match base.content(rel) {
+            Ok(b) => b,
+            Err(_) => {
+                return Ok(FileDiff::placeholder(
+                    rel.to_path_buf(),
+                    kind,
+                    DiffKind::Unreadable,
+                ))
+            }
+        }
     };
     let new = if kind == ChangeKind::Deleted {
         None
     } else {
-        read_live(root, rel)?
+        match read_live(root, rel) {
+            Ok(b) => b,
+            Err(_) => {
+                return Ok(FileDiff::placeholder(
+                    rel.to_path_buf(),
+                    kind,
+                    DiffKind::Unreadable,
+                ))
+            }
+        }
     };
 
     let diff_kind = diff::classify(old.as_deref(), new.as_deref(), cfg.size_cap);
@@ -180,6 +245,7 @@ pub fn diff_file(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// In-memory baseline for tests.
@@ -240,6 +306,74 @@ mod tests {
         assert_eq!(by.get("b.txt"), Some(&ChangeKind::Added));
         assert_eq!(by.get("d.txt"), Some(&ChangeKind::Deleted));
         assert!(!by.contains_key("c.txt"), "unchanged file must be skipped");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unreadable_file_degrades_instead_of_killing_the_scan() {
+        let root = temp_root();
+        write(&root, "good.txt", "fine\n");
+        write(&root, "secret.txt", "locked\n");
+        std::fs::set_permissions(
+            root.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let base = MapBaseline(HashMap::new());
+        let changes = scan(&root, &base, &ScanConfig::default()).unwrap();
+
+        let secret = changes
+            .iter()
+            .find(|c| c.path == Path::new("secret.txt"))
+            .expect("unreadable file still listed");
+        assert_eq!(secret.diff_kind, DiffKind::Unreadable);
+        assert!(
+            changes.iter().any(|c| c.path == Path::new("good.txt")),
+            "other files must still be scanned"
+        );
+
+        std::fs::set_permissions(
+            root.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn crlf_only_change_is_not_a_change() {
+        let root = temp_root();
+        write(&root, "a.txt", "one\ntwo\n"); // LF live
+
+        let mut base = HashMap::new();
+        base.insert(PathBuf::from("a.txt"), b"one\r\ntwo\r\n".to_vec()); // CRLF baseline
+        let base = MapBaseline(base);
+
+        let changes = scan(&root, &base, &ScanConfig::default()).unwrap();
+        assert!(
+            changes.is_empty(),
+            "CRLF-only difference must not be reported: {changes:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn size_cap_short_circuits_without_reading() {
+        let root = temp_root();
+        write(&root, "big.bin", &"x".repeat(4096));
+        let base = MapBaseline(HashMap::new());
+        let cfg = ScanConfig { size_cap: 1024 };
+
+        let changes = scan(&root, &base, &cfg).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].diff_kind, DiffKind::TooLarge);
+
+        let fd = diff_file(&root, &base, Path::new("big.bin"), ChangeKind::Added, &cfg).unwrap();
+        assert_eq!(fd.diff_kind, DiffKind::TooLarge);
+        assert!(fd.hunks.is_empty());
 
         std::fs::remove_dir_all(&root).ok();
     }

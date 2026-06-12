@@ -28,12 +28,17 @@ pub fn walk_live(root: &Path) -> Result<Vec<PathBuf>> {
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        // Honor .gitignore files even outside a git repository — non-git
+        // directories are a supported use case.
+        .require_git(false)
         .parents(true)
         .overrides(overrides)
         .build();
 
     for result in walker {
-        let entry = result?;
+        // Skip unreadable entries (e.g. permission-denied directories): one
+        // inaccessible path must not abort the whole walk.
+        let Ok(entry) = result else { continue };
         if entry.file_type().is_none_or(|ft| !ft.is_file()) {
             continue;
         }
@@ -60,7 +65,7 @@ pub fn walk_all(dir: &Path) -> Result<Vec<PathBuf>> {
         .follow_links(false)
         .build();
     for result in walker {
-        let entry = result?;
+        let Ok(entry) = result else { continue };
         if entry.file_type().is_none_or(|ft| !ft.is_file()) {
             continue;
         }

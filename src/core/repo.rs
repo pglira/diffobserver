@@ -16,13 +16,18 @@ impl Repo {
     /// start directory is used as-is.
     pub fn discover(start: &Path) -> Repo {
         match gix::discover(start) {
-            Ok(repo) => {
-                let root = repo
-                    .workdir()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| start.to_path_buf());
-                Repo { root, is_git: true }
-            }
+            // A bare repository has no working tree to diff; treat it like a
+            // plain directory rather than offering a meaningless HEAD baseline.
+            Ok(repo) => match repo.workdir() {
+                Some(workdir) => Repo {
+                    root: workdir.to_path_buf(),
+                    is_git: true,
+                },
+                None => Repo {
+                    root: start.to_path_buf(),
+                    is_git: false,
+                },
+            },
             Err(_) => Repo {
                 root: start.to_path_buf(),
                 is_git: false,

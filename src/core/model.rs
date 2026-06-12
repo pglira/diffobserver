@@ -30,6 +30,9 @@ pub enum DiffKind {
     Binary,
     /// File exceeded the size cap; diff skipped.
     TooLarge,
+    /// File content could not be read (e.g. permission denied); listed but
+    /// not diffed. One bad file must never break the rest of the scan.
+    Unreadable,
 }
 
 /// A summary entry for one changed file, cheap to compute for every change.
@@ -91,11 +94,15 @@ pub struct Hunk {
 }
 
 impl Hunk {
-    /// The `@@ -a,b +c,d @@` header text.
+    /// The `@@ -a,b +c,d @@` header text. Per the unified-diff convention, a
+    /// zero-length range is anchored to the line *before* it (0 at the start
+    /// of the file), e.g. `@@ -0,0 +1,3 @@` for a pure addition.
     pub fn header(&self) -> String {
+        let old_start = if self.old_len == 0 { self.old_start - 1 } else { self.old_start };
+        let new_start = if self.new_len == 0 { self.new_start - 1 } else { self.new_start };
         format!(
             "@@ -{},{} +{},{} @@",
-            self.old_start, self.old_len, self.new_start, self.new_len
+            old_start, self.old_len, new_start, self.new_len
         )
     }
 }
@@ -124,10 +131,5 @@ impl FileDiff {
             old_text: None,
             new_text: None,
         }
-    }
-
-    /// Total number of change (non-context) lines across all hunks.
-    pub fn change_count(&self) -> usize {
-        self.hunks.iter().map(|h| h.lines.len()).sum()
     }
 }

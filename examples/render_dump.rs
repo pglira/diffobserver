@@ -37,7 +37,7 @@ fn main() {
     let repo = Repo::discover(&start);
 
     let (evt_tx, evt_rx) = mpsc::channel::<Event>();
-    let req_tx = worker::spawn(repo.root.clone(), ScanConfig::default(), evt_tx.clone());
+    let req_tx = worker::spawn(repo.root.clone(), ScanConfig::default(), "base16-ocean.dark".into(), true, evt_tx.clone());
     let mut app = App::new(repo.root.clone(), repo.is_git, Config::default(), req_tx);
     app.start();
     pump(&mut app, &evt_rx, Duration::from_secs(3));

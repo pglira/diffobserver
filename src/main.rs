@@ -64,7 +64,13 @@ fn main() -> Result<()> {
     let scan_cfg = ScanConfig {
         size_cap: cfg.size_cap_bytes,
     };
-    let req_tx = worker::spawn(repo.root.clone(), scan_cfg, evt_tx.clone());
+    let req_tx = worker::spawn(
+        repo.root.clone(),
+        scan_cfg,
+        cfg.theme_name().to_string(),
+        cfg.syntax_highlight,
+        evt_tx.clone(),
+    );
 
     // Held for the lifetime of the app; dropping it stops watching.
     let _watcher = watch::spawn(&repo.root, evt_tx.clone())
@@ -125,6 +131,11 @@ fn run_loop(terminal: &mut Tui, app: &mut App, evt_rx: &Receiver<Event>) -> Resu
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
+        }
+
+        // Housekeeping that must run even without events (toast expiry).
+        if app.tick() {
+            dirty = true;
         }
     }
     Ok(())

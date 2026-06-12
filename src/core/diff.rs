@@ -60,12 +60,10 @@ pub fn count_lines(old: &str, new: &str) -> (usize, usize) {
     (added, removed)
 }
 
-/// Strip a single trailing line terminator from a segment value.
+/// Strip a single trailing line terminator (`\n` or `\r\n`) from a segment.
 fn trim_eol(s: &str) -> &str {
-    s.strip_suffix('\n')
-        .unwrap_or(s)
-        .strip_suffix('\r')
-        .unwrap_or_else(|| s.strip_suffix('\n').unwrap_or(s))
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    s.strip_suffix('\r').unwrap_or(s)
 }
 
 /// Build unified hunks (with word-level segments and line numbers) for a pair
@@ -141,6 +139,16 @@ mod tests {
         assert_eq!(classify(Some(b"a"), Some(&[0u8; 4]), 1024), DiffKind::Binary);
         assert_eq!(classify(Some(b"a"), Some(b"b"), 0), DiffKind::TooLarge);
         assert_eq!(classify(Some(b"a"), Some(b"b"), 1024), DiffKind::Text);
+    }
+
+    #[test]
+    fn zero_length_ranges_follow_unified_convention() {
+        // Pure addition: old side is `-0,0`.
+        let hunks = compute_hunks("", "a\nb\n");
+        assert_eq!(hunks[0].header(), "@@ -0,0 +1,2 @@");
+        // Pure deletion: new side is `+0,0`.
+        let hunks = compute_hunks("a\nb\n", "");
+        assert_eq!(hunks[0].header(), "@@ -1,2 +0,0 @@");
     }
 
     #[test]

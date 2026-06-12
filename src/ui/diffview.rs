@@ -2,6 +2,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthChar;
 
 use crate::core::model::{ChangeKind, DiffKind, DiffLine, FileDiff, LineTag};
 use crate::ui::highlight::Highlighter;
@@ -36,7 +37,10 @@ enum SRow {
 }
 
 /// A fully prepared diff for one file, ready to render in either layout.
+/// Built on the worker thread: highlighting can take long on big files and
+/// must never block the UI.
 pub struct Prepared {
+    pub path: std::path::PathBuf,
     pub kind: ChangeKind,
     pub diff_kind: DiffKind,
     hunks: Vec<PHunk>,
@@ -49,12 +53,29 @@ pub struct Prepared {
 
 impl Prepared {
     pub fn build(fd: &FileDiff, hl: &Highlighter) -> Prepared {
-        let old_hl = hl.highlight(&fd.path, fd.old_text.as_deref().unwrap_or(""));
-        let new_hl = hl.highlight(&fd.path, fd.new_text.as_deref().unwrap_or(""));
+        // Highlight only as far as the deepest line any hunk displays;
+        // everything past it is never rendered.
+        let max_old = fd
+            .hunks
+            .iter()
+            .map(|h| h.old_start + h.old_len)
+            .max()
+            .unwrap_or(0);
+        let max_new = fd
+            .hunks
+            .iter()
+            .map(|h| h.new_start + h.new_len)
+            .max()
+            .unwrap_or(0);
+        let old_hl = hl.highlight(&fd.path, fd.old_text.as_deref().unwrap_or(""), max_old);
+        let new_hl = hl.highlight(&fd.path, fd.new_text.as_deref().unwrap_or(""), max_new);
 
         let notice = match fd.diff_kind {
             DiffKind::Binary => Some("Binary file differs (no content diff)".into()),
             DiffKind::TooLarge => Some("File too large — diff skipped".into()),
+            DiffKind::Unreadable => {
+                Some("File could not be read (permission denied?)".into())
+            }
             DiffKind::Text if fd.hunks.is_empty() => Some("No textual changes".into()),
             DiffKind::Text => None,
         };
@@ -82,6 +103,7 @@ impl Prepared {
         let (srows, soff) = build_srows(&hunks);
 
         Prepared {
+            path: fd.path.clone(),
             kind: fd.kind,
             diff_kind: fd.diff_kind,
             hunks,
@@ -259,7 +281,7 @@ fn prepare_line(
     let emph: Vec<bool> = dl
         .segments
         .iter()
-        .flat_map(|s| std::iter::repeat(s.emph).take(s.text.chars().count()))
+        .flat_map(|s| std::iter::repeat_n(s.emph, s.text.chars().count()))
         .collect();
 
     let mut pieces: Vec<(Color, bool, String)> = Vec::new();
@@ -378,6 +400,9 @@ fn side_spans(pl: Option<&PLine>, side: Side, width: usize, pal: &DiffPalette) -
     spans
 }
 
+/// Append as much of `text` as fits in the remaining cells, accounting for
+/// display width (CJK and emoji occupy two terminal cells, not one — counting
+/// chars here desynchronizes the split columns).
 fn push_trunc(
     spans: &mut Vec<Span<'static>>,
     text: &str,
@@ -389,11 +414,18 @@ fn push_trunc(
     if *used >= width {
         return;
     }
-    let remaining = width - *used;
-    let taken: String = text.chars().take(remaining).collect();
-    let len = taken.chars().count();
-    if len > 0 {
+    let mut taken = String::new();
+    let mut cells = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if *used + cells + w > width {
+            break;
+        }
+        taken.push(ch);
+        cells += w;
+    }
+    if !taken.is_empty() {
         spans.push(Span::styled(taken, Style::default().fg(fg).bg(bg)));
-        *used += len;
+        *used += cells;
     }
 }

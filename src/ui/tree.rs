@@ -54,6 +54,12 @@ pub struct Tree {
     pub state: ListState,
 }
 
+impl Default for Tree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tree {
     pub fn new() -> Self {
         Tree {
@@ -112,26 +118,6 @@ impl Tree {
         let next = (cur + delta).clamp(0, self.rows.len() as isize - 1) as usize;
         self.state.select(Some(next));
         self.file_at(next)
-    }
-
-    /// Move to the next/prev file row (skipping directories).
-    pub fn step_file(&mut self, forward: bool) -> Option<PathBuf> {
-        if self.rows.is_empty() {
-            return None;
-        }
-        let start = self.selected();
-        let range: Vec<usize> = if forward {
-            (start + 1..self.rows.len()).collect()
-        } else {
-            (0..start).rev().collect()
-        };
-        for i in range {
-            if !self.rows[i].is_dir {
-                self.state.select(Some(i));
-                return self.file_at(i);
-            }
-        }
-        None
     }
 
     /// Toggle collapse on the selected directory. Returns true if a rebuild is
@@ -260,6 +246,7 @@ fn render_row(r: &Row) -> ListItem<'static> {
         let meta = match r.diff_kind {
             Some(DiffKind::Binary) => "  (bin)".to_string(),
             Some(DiffKind::TooLarge) => "  (large)".to_string(),
+            Some(DiffKind::Unreadable) => "  (unreadable)".to_string(),
             _ => format!("  +{} -{}", r.added, r.removed),
         };
         spans.push(Span::styled(meta, Style::default().fg(Color::DarkGray)));

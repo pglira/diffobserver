@@ -4,6 +4,10 @@
 //! snapshot only costs disk for files that actually changed. To make the
 //! rsync-style size+mtime quick-check work across saves, copied files have
 //! their mtime preserved from the source.
+//!
+//! Saves are atomic: files are copied into a dot-prefixed temp directory that
+//! is renamed into place on success and removed on failure, so a failed or
+//! interrupted save never leaves a half-written snapshot behind.
 
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -49,6 +53,7 @@ pub fn snapshot_path(root: &Path, name: &str) -> PathBuf {
 }
 
 /// List saved snapshots, newest first by mtime, marking the latest.
+/// Dot-prefixed entries (temp dirs, `.gitignore`) are internal and skipped.
 pub fn list(root: &Path) -> Result<Vec<SnapshotInfo>> {
     let dir = snapshots_dir(root);
     let latest = latest_name(root);
@@ -57,7 +62,7 @@ pub fn list(root: &Path) -> Result<Vec<SnapshotInfo>> {
         for e in std::fs::read_dir(&dir)? {
             let e = e?;
             let name = e.file_name().to_string_lossy().into_owned();
-            if name == "latest" || !e.file_type()?.is_dir() {
+            if name == "latest" || name.starts_with('.') || !e.file_type()?.is_dir() {
                 continue;
             }
             entries.push((e.path(), name));
@@ -74,8 +79,22 @@ pub fn list(root: &Path) -> Result<Vec<SnapshotInfo>> {
         .collect())
 }
 
-/// Default snapshot name: `snap-YYYYMMDD-HHMMSS` (UTC).
+/// Default snapshot name: `snap-YYYYMMDD-HHMMSS` in local time, falling back
+/// to UTC if local time cannot be determined.
 pub fn default_name() -> String {
+    if let Ok(out) = std::process::Command::new("date")
+        .arg("+%Y%m%d-%H%M%S")
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                let s = s.trim();
+                if s.len() == 15 {
+                    return format!("snap-{s}");
+                }
+            }
+        }
+    }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -84,20 +103,57 @@ pub fn default_name() -> String {
     format!("snap-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
+/// Reject names that would collide with store internals or escape the dir.
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "latest"
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.contains('\\')
+    {
+        anyhow::bail!(
+            "invalid snapshot name {name:?} (must not be empty, 'latest', dot-prefixed, or contain slashes)"
+        );
+    }
+    Ok(())
+}
+
 /// Save the working tree at `root` into `.snapshots/<name>` and repoint
 /// `latest`. Fails if a snapshot of that name already exists.
 pub fn save(root: &Path, name: &str) -> Result<()> {
-    if name.is_empty() || name.contains('/') {
-        anyhow::bail!("invalid snapshot name: {name:?}");
-    }
+    validate_name(name)?;
     let snap = snapshots_dir(root);
     let dest = snap.join(name);
     if dest.exists() {
         anyhow::bail!("snapshot '{name}' already exists");
     }
     let prev = latest_dir(root);
-    std::fs::create_dir_all(&dest)?;
+    std::fs::create_dir_all(&snap).context("creating .snapshots")?;
+    ensure_self_gitignore(&snap);
 
+    // Copy into a temp dir first so a failed save leaves nothing behind.
+    let tmp = snap.join(format!(".tmp-{name}"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    if let Err(e) = copy_tree(root, &tmp, prev.as_deref()) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, &dest).context("moving snapshot into place")?;
+
+    // Repoint `latest` atomically via a temp symlink + rename.
+    let link = snap.join("latest");
+    let tmp_link = snap.join(".latest.tmp");
+    let _ = std::fs::remove_file(&tmp_link);
+    symlink(name, &tmp_link).context("creating latest symlink")?;
+    std::fs::rename(&tmp_link, &link).context("updating latest symlink")?;
+    Ok(())
+}
+
+/// Copy the working tree into `dest`, hard-linking unchanged files to `prev`.
+/// Files that vanish between the walk and the copy are skipped: the tool's
+/// whole premise is a tree that is actively changing.
+fn copy_tree(root: &Path, dest: &Path, prev: Option<&Path>) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
     for rel in excludes::walk_live(root)? {
         let src = root.join(&rel);
         let target = dest.join(&rel);
@@ -106,38 +162,46 @@ pub fn save(root: &Path, name: &str) -> Result<()> {
         }
 
         let linked = prev
-            .as_deref()
             .map(|p| p.join(&rel))
             .filter(|prev_file| files_match(&src, prev_file))
             .is_some_and(|prev_file| std::fs::hard_link(&prev_file, &target).is_ok());
 
         if !linked {
-            copy_preserving_mtime(&src, &target)
-                .with_context(|| format!("copying {}", rel.display()))?;
-            set_readonly(&target);
+            match copy_preserving_mtime(&src, &target) {
+                Ok(()) => set_readonly(&target),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("copying {}", rel.display())),
+            }
         }
     }
-
-    // Repoint `latest` atomically via a temp symlink + rename.
-    let link = snap.join("latest");
-    let tmp = snap.join(".latest.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    symlink(name, &tmp).context("creating latest symlink")?;
-    std::fs::rename(&tmp, &link).context("updating latest symlink")?;
     Ok(())
 }
 
+/// Make the snapshot store ignore itself so `git add -A` in the target repo
+/// can never commit it.
+fn ensure_self_gitignore(snap: &Path) {
+    let path = snap.join(".gitignore");
+    if !path.exists() {
+        let _ = std::fs::write(path, "*\n");
+    }
+}
+
 /// rsync-style quick check: same size and same mtime means "unchanged".
-fn files_match(a: &Path, b: &Path) -> bool {
+pub(crate) fn files_match(a: &Path, b: &Path) -> bool {
     let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
         return false;
     };
     ma.len() == mb.len() && ma.modified().ok() == mb.modified().ok() && ma.modified().is_ok()
 }
 
-fn copy_preserving_mtime(src: &Path, dst: &Path) -> Result<()> {
+/// Copy `src` to `dst`, stamping `dst` with `src`'s mtime as observed BEFORE
+/// the copy. If the file is modified mid-copy the torn copy then carries the
+/// old mtime, so the next save's quick-check sees a mismatch and re-copies it
+/// instead of hard-linking the torn content forward.
+fn copy_preserving_mtime(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mtime = std::fs::metadata(src)?.modified().ok();
     std::fs::copy(src, dst)?;
-    if let Ok(mtime) = std::fs::metadata(src).and_then(|m| m.modified()) {
+    if let Some(mtime) = mtime {
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst) {
             let _ = f.set_modified(mtime);
         }
@@ -177,6 +241,7 @@ fn civil_from_epoch(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -213,6 +278,59 @@ mod tests {
         assert_eq!(std::fs::read_to_string(s1.join("a.txt")).unwrap(), "A1");
         assert_eq!(std::fs::read_to_string(s2.join("a.txt")).unwrap(), "A2-longer");
         assert_eq!(latest_name(&root).as_deref(), Some("s2"));
+
+        // The store ignores itself from git.
+        assert_eq!(
+            std::fs::read_to_string(snapshots_dir(&root).join(".gitignore")).unwrap(),
+            "*\n"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reserved_and_invalid_names_rejected_without_side_effects() {
+        let root = temp_root();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+
+        for bad in ["latest", "", ".hidden", "a/b", "..", "."] {
+            assert!(save(&root, bad).is_err(), "name {bad:?} must be rejected");
+        }
+        // The store must be untouched and fully functional afterwards.
+        assert!(latest_dir(&root).is_none());
+        save(&root, "good").unwrap();
+        assert_eq!(latest_name(&root).as_deref(), Some("good"));
+        assert_eq!(list(&root).unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn failed_save_cleans_up_and_allows_retry() {
+        let root = temp_root();
+        std::fs::write(root.join("ok.txt"), "fine").unwrap();
+        std::fs::write(root.join("secret.txt"), "locked").unwrap();
+        std::fs::set_permissions(
+            root.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let err = save(&root, "s1");
+        assert!(err.is_err(), "unreadable file must fail the save");
+        // No partial snapshot, no temp dir, no latest pointer.
+        assert!(!snapshot_path(&root, "s1").exists());
+        assert!(list(&root).unwrap().is_empty());
+        assert!(latest_dir(&root).is_none());
+
+        // After fixing the permission, the same name works.
+        std::fs::set_permissions(
+            root.join("secret.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        save(&root, "s1").unwrap();
+        assert_eq!(latest_name(&root).as_deref(), Some("s1"));
 
         std::fs::remove_dir_all(&root).ok();
     }

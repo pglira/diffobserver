@@ -16,6 +16,20 @@ pub trait BaselineSource {
     fn paths(&self) -> Result<Vec<PathBuf>>;
     /// Content of `rel` in the baseline, or `None` if it is absent there.
     fn content(&self, rel: &Path) -> Result<Option<Vec<u8>>>;
+    /// Cheap metadata check: `true` means the live file at `live` is
+    /// definitely unchanged vs the baseline's `rel` (rsync size+mtime
+    /// semantics), so content reads can be skipped. `false` means unknown —
+    /// do the full comparison.
+    fn quick_unchanged(&self, live: &Path, rel: &Path) -> bool {
+        let _ = (live, rel);
+        false
+    }
+    /// Size in bytes of `rel` in the baseline, if cheaply available without
+    /// loading the content.
+    fn size(&self, rel: &Path) -> Option<u64> {
+        let _ = rel;
+        None
+    }
     /// Human-readable label for the status bar.
     fn label(&self) -> &str;
 }
@@ -53,6 +67,14 @@ impl BaselineSource for SnapshotBaseline {
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+    fn quick_unchanged(&self, live: &Path, rel: &Path) -> bool {
+        // Snapshot copies preserve the source mtime exactly so this check
+        // works across saves; hardlinked files share it for free.
+        crate::core::snapshot::files_match(live, &self.dir.join(rel))
+    }
+    fn size(&self, rel: &Path) -> Option<u64> {
+        std::fs::metadata(self.dir.join(rel)).ok().map(|m| m.len())
     }
     fn label(&self) -> &str {
         &self.label
@@ -115,6 +137,11 @@ impl BaselineSource for GitHeadBaseline {
             }
             None => Ok(None),
         }
+    }
+    fn size(&self, rel: &Path) -> Option<u64> {
+        // Object header lookup decodes only the size, not the content.
+        let oid = self.entries.get(rel)?;
+        self.repo.find_header(*oid).ok().map(|h| h.size())
     }
     fn label(&self) -> &str {
         &self.label

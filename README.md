@@ -41,7 +41,8 @@ cargo build --release
 # binary at target/release/diffobserver
 ```
 
-Requires a recent stable Rust toolchain.
+Requires Rust 1.85+ (edition 2024). Linux/macOS only (uses Unix symlinks and
+permissions).
 
 ## Usage
 
@@ -67,6 +68,8 @@ moves to it.
 | `n` / `N` | next / previous change (crosses file boundaries) |
 | `g` / `G` | top / bottom |
 | `Ctrl-d` / `Ctrl-u` | half-page down / up in the diff |
+| `PageUp` / `PageDown` | full page up / down in the diff |
+| `Esc` | return focus to the tree (from the diff) |
 | `S` | take a snapshot (prompts for a name) |
 | `s` | switch baseline (snapshots / `HEAD`) |
 | `e` | open `$EDITOR` at the current change |
@@ -79,9 +82,11 @@ moves to it.
 ## Excludes
 
 Files ignored by git (`.gitignore`, nested ignores, global excludes,
-`.git/info/exclude`) are excluded from both snapshots and diffs. `.git/` and
-`.snapshots/` are always skipped. Dotfiles are *not* hidden, so changes to e.g.
-`.gitignore` or `.github/` are visible.
+`.git/info/exclude`) are excluded from both snapshots and diffs — also outside
+git repositories, where `.gitignore` files are still honored. `.git/` and
+`.snapshots/` are always skipped, and the snapshot store writes a
+`.snapshots/.gitignore` so it can never be committed accidentally. Dotfiles are
+*not* hidden, so changes to e.g. `.gitignore` or `.github/` are visible.
 
 ## Configuration (optional)
 
@@ -109,8 +114,17 @@ syntax_highlight = true
 - **Binary** files (NUL byte detected) are listed but show a placeholder instead
   of a content diff.
 - **Large** files over the size cap are listed but not diffed.
+- **Unreadable** files (permission denied) are listed with a placeholder; one
+  bad file never breaks the rest of the scan.
+- **Symlinks** are ignored entirely: not diffed and not snapshotted (unlike
+  `snap.sh`'s rsync, which preserves them).
 - Renames are not detected (they appear as an add + a delete), matching the
   `diff -rqN` semantics of `snap.sh`.
+- Default snapshot names use local time (falling back to UTC if the `date`
+  command is unavailable). The names `latest` and anything dot-prefixed are
+  reserved.
+- Saving a snapshot only advances the baseline when you are already tracking
+  `latest`; an explicitly chosen baseline (HEAD or an older snapshot) is kept.
 
 ## Relationship to `snap.sh`
 

@@ -144,7 +144,7 @@ fn rescan_preserves_tree_selection_on_dir_row() {
     write(&root, "ui/mod.rs", "fn a() { let x = 1; }\n");
 
     let (evt_tx, evt_rx) = mpsc::channel::<Event>();
-    let req_tx = worker::spawn(root.clone(), ScanConfig::default(), evt_tx.clone());
+    let req_tx = worker::spawn(root.clone(), ScanConfig::default(), "base16-ocean.dark".into(), false, evt_tx.clone());
     let mut app = App::new(root.clone(), false, Config::default(), req_tx.clone());
     app.start();
     pump(&mut app, &evt_rx, Duration::from_secs(3));
@@ -190,7 +190,7 @@ fn rescan_churn_preserves_diff_scroll() {
     write(&root, "long.txt", &changed);
 
     let (evt_tx, evt_rx) = mpsc::channel::<Event>();
-    let req_tx = worker::spawn(root.clone(), ScanConfig::default(), evt_tx.clone());
+    let req_tx = worker::spawn(root.clone(), ScanConfig::default(), "base16-ocean.dark".into(), false, evt_tx.clone());
     let mut app = App::new(root.clone(), false, Config::default(), req_tx.clone());
     app.start();
 
@@ -211,13 +211,13 @@ fn rescan_churn_preserves_diff_scroll() {
     }
     assert_eq!(app.diff_scroll, 3);
 
-    // Two filesystem events back-to-back put two scan→diff cycles in flight;
-    // the refreshed diffs must not reset the scroll position.
+    // Filesystem events back-to-back trigger refresh cycles (the worker may
+    // coalesce them); the refreshed diff must not reset the scroll position.
     app.on_event(Event::Fs(vec![root.join("long.txt")]));
     app.on_event(Event::Fs(vec![root.join("long.txt")]));
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut diffs_seen = 0;
-    while diffs_seen < 2 && Instant::now() < deadline {
+    while diffs_seen < 1 && Instant::now() < deadline {
         if let Ok(ev) = evt_rx.recv_timeout(Duration::from_millis(100)) {
             if matches!(&ev, Event::Worker(worker::Evt::Diff(_, _))) {
                 diffs_seen += 1;
@@ -225,8 +225,48 @@ fn rescan_churn_preserves_diff_scroll() {
             app.on_event(ev);
         }
     }
-    assert_eq!(diffs_seen, 2, "expected two refreshed diffs to arrive");
+    // Drain any further events (a second non-coalesced refresh, stragglers).
+    pump(&mut app, &evt_rx, Duration::from_millis(500));
+    assert!(diffs_seen >= 1, "expected a refreshed diff to arrive");
     assert_eq!(app.diff_scroll, 3, "scroll must survive background refreshes");
+
+    let _ = req_tx.send(worker::Req::Shutdown);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn rescan_bursts_are_coalesced() {
+    let root = temp_dir("coalesce");
+    write(&root, "a.txt", "one\n");
+    snapshot::save(&root, "base").unwrap();
+    write(&root, "a.txt", "two\n");
+
+    let (evt_tx, evt_rx) = mpsc::channel::<Event>();
+    let req_tx = worker::spawn(root.clone(), ScanConfig::default(), "base16-ocean.dark".into(), false, evt_tx.clone());
+    let mut app = App::new(root.clone(), false, Config::default(), req_tx.clone());
+    app.start();
+    pump(&mut app, &evt_rx, Duration::from_secs(3));
+
+    // A burst of fs events queues a burst of rescan requests; the worker must
+    // coalesce them instead of executing five full scans.
+    let mut scans = 0;
+    for _ in 0..5 {
+        app.on_event(Event::Fs(vec![root.join("a.txt")]));
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match evt_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(ev) => {
+                if matches!(&ev, Event::Worker(worker::Evt::Scanned(_))) {
+                    scans += 1;
+                }
+                app.on_event(ev);
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(scans >= 1, "at least one rescan must run");
+    assert!(scans < 5, "burst of 5 rescans must be coalesced, got {scans}");
 
     let _ = req_tx.send(worker::Req::Shutdown);
     std::fs::remove_dir_all(&root).ok();
@@ -243,7 +283,7 @@ fn headless_render_does_not_panic() {
     write(&root, "c/new.rs", "fn brand_new() {}\n");
 
     let (evt_tx, evt_rx) = mpsc::channel::<Event>();
-    let req_tx = worker::spawn(root.clone(), ScanConfig::default(), evt_tx.clone());
+    let req_tx = worker::spawn(root.clone(), ScanConfig::default(), "base16-ocean.dark".into(), false, evt_tx.clone());
     let mut app = App::new(root.clone(), false, Config::default(), req_tx.clone());
     app.start();
 

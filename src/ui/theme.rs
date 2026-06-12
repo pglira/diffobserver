@@ -21,8 +21,6 @@ pub struct DiffPalette {
     pub gutter_fg: Color,
     /// Foreground for hunk headers (`@@ ... @@`).
     pub hunk_fg: Color,
-    /// Fallback foreground when syntax highlighting is off.
-    pub default_fg: Color,
 }
 
 impl DiffPalette {
@@ -36,7 +34,6 @@ impl DiffPalette {
                 del_emph_bg: Color::Rgb(102, 36, 38),
                 gutter_fg: Color::Rgb(110, 110, 122),
                 hunk_fg: Color::Rgb(126, 148, 210),
-                default_fg: Color::Rgb(202, 202, 208),
             },
             Mode::Light => DiffPalette {
                 add_bg: Color::Rgb(220, 242, 222),
@@ -46,7 +43,6 @@ impl DiffPalette {
                 del_emph_bg: Color::Rgb(244, 178, 178),
                 gutter_fg: Color::Rgb(140, 140, 150),
                 hunk_fg: Color::Rgb(60, 90, 170),
-                default_fg: Color::Rgb(40, 40, 46),
             },
         }
     }

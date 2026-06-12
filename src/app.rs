@@ -1,9 +1,11 @@
 //! Central application state and event handling.
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ratatui::crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
@@ -12,16 +14,19 @@ use crate::core::baseline::BaselineRef;
 use crate::core::model::FileChange;
 use crate::core::snapshot;
 use crate::ui::diffview::Prepared;
-use crate::ui::highlight::Highlighter;
 use crate::ui::theme::DiffPalette;
 use crate::ui::tree::Tree;
 use crate::worker::{self, Req};
+
+/// How long a toast stays visible.
+pub const TOAST_TTL: Duration = Duration::from_secs(5);
 
 /// Everything that can wake the UI thread.
 pub enum Event {
     Input(CtEvent),
     Worker(worker::Evt),
     Fs(Vec<PathBuf>),
+    WatchError(String),
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -83,7 +88,9 @@ pub struct App {
     pub picker_items: Vec<PickerItem>,
     pub picker_state: ListState,
 
-    highlighter: Highlighter,
+    /// Gitignore matcher used to drop fs events for ignored paths (e.g.
+    /// `target/` churn during builds) before they trigger rescans.
+    fs_ignore: Option<Gitignore>,
     pub palette: DiffPalette,
 
     pub diff_area_height: usize,
@@ -95,9 +102,9 @@ pub struct App {
 
 impl App {
     pub fn new(root: PathBuf, repo_is_git: bool, cfg: Config, req_tx: Sender<Req>) -> Self {
-        let highlighter = Highlighter::new(cfg.theme_name(), cfg.syntax_highlight);
         let palette = DiffPalette::for_mode(cfg.mode);
         let tree_width = cfg.tree_width_percent();
+        let fs_ignore = build_fs_ignore(&root);
 
         // Default baseline: latest snapshot if one exists, else HEAD.
         let baseline_ref = if snapshot::latest_dir(&root).is_some() {
@@ -131,7 +138,7 @@ impl App {
             prompt_input: String::new(),
             picker_items: Vec::new(),
             picker_state: ListState::default(),
-            highlighter,
+            fs_ignore,
             palette,
             diff_area_height: 1,
             diff_total_rows: 0,
@@ -158,6 +165,21 @@ impl App {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    /// Periodic housekeeping; returns true if a redraw is needed (e.g. an
+    /// expired toast must disappear even when no events arrive).
+    pub fn tick(&mut self) -> bool {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed() >= TOAST_TTL)
+        {
+            self.toast = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn on_event(&mut self, event: Event) {
         match event {
             Event::Input(CtEvent::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -166,6 +188,7 @@ impl App {
             Event::Input(_) => {}
             Event::Worker(evt) => self.handle_worker(evt),
             Event::Fs(paths) => self.handle_fs(paths),
+            Event::WatchError(msg) => self.toast(format!("watcher: {msg}")),
         }
     }
 
@@ -183,9 +206,16 @@ impl App {
                 self.tree.rebuild(&self.changes);
                 self.sync_current_after_scan();
             }
-            Diff(fd, arrival) => self.apply_diff(fd, arrival),
+            Diff(prepared, arrival) => self.apply_diff(*prepared, arrival),
             SnapshotSaved(name) => self.toast(format!("saved snapshot: {name}")),
-            Error(msg) => self.toast(format!("error: {msg}")),
+            Error(msg) => {
+                // The initial label only resolves on success; give it a
+                // useful resting state when resolution fails.
+                if self.baseline_label == "(resolving…)" {
+                    self.baseline_label = "(none — press S)".into();
+                }
+                self.toast(format!("error: {msg}"));
+            }
         }
     }
 
@@ -211,22 +241,43 @@ impl App {
     }
 
     fn handle_fs(&mut self, paths: Vec<PathBuf>) {
-        // Ignore churn under .git/ and .snapshots/.
-        let relevant = paths.iter().any(|p| {
+        let mut relevant = false;
+        let mut gitignore_changed = false;
+        for p in &paths {
             let rel = p.strip_prefix(&self.root).unwrap_or(p);
-            !rel.starts_with(".git") && !rel.starts_with(".snapshots")
-        });
+            if rel.starts_with(".git") || rel.starts_with(".snapshots") {
+                continue;
+            }
+            // Edits to ignore rules change what "ignored" means.
+            if rel.file_name() == Some(OsStr::new(".gitignore")) {
+                gitignore_changed = true;
+                relevant = true;
+                continue;
+            }
+            // Drop events for gitignored paths (target/ churn during builds).
+            // The matcher covers the root .gitignore and .git/info/exclude;
+            // nested .gitignore files aren't loaded, so their matches still
+            // trigger (harmless, merely unnecessary) rescans.
+            let ignored = self.fs_ignore.as_ref().is_some_and(|g| {
+                g.matched_path_or_any_parents(rel, p.is_dir()).is_ignore()
+            });
+            if !ignored {
+                relevant = true;
+            }
+        }
+        if gitignore_changed {
+            self.fs_ignore = build_fs_ignore(&self.root);
+        }
         if relevant {
             self.send(Req::Rescan);
         }
     }
 
-    fn apply_diff(&mut self, fd: crate::core::model::FileDiff, arrival: Arrival) {
+    fn apply_diff(&mut self, prepared: Prepared, arrival: Arrival) {
         // Only apply if it still matches the selected file.
-        if self.current_path.as_deref() != Some(fd.path.as_path()) {
+        if self.current_path.as_deref() != Some(prepared.path.as_path()) {
             return;
         }
-        let prepared = Prepared::build(&fd, &self.highlighter);
         self.hunk_offsets = prepared.hunk_offsets(self.split).to_vec();
         self.diff_total_rows = prepared.row_count(self.split);
 
@@ -329,11 +380,7 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 match self.tree.selected_row().map(|r| (r.is_dir(), r.path.clone())) {
-                    Some((true, _)) => {
-                        if self.tree.toggle_collapse() {
-                            self.tree.rebuild(&self.changes);
-                        }
-                    }
+                    Some((true, _)) => self.collapse_selected(),
                     Some((false, p)) => {
                         self.request_diff(p, Arrival::Fresh);
                         self.focus = Focus::Diff;
@@ -341,11 +388,7 @@ impl App {
                     None => {}
                 }
             }
-            KeyCode::Char('h') | KeyCode::Left => {
-                if self.tree.toggle_collapse() {
-                    self.tree.rebuild(&self.changes);
-                }
-            }
+            KeyCode::Char('h') | KeyCode::Left => self.collapse_selected(),
             KeyCode::Char('g') | KeyCode::Home => {
                 if let Some(p) = self.tree.move_sel(isize::MIN / 2) {
                     self.request_diff(p, Arrival::Fresh);
@@ -357,6 +400,13 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Toggle collapse on the selected tree directory and rebuild if needed.
+    fn collapse_selected(&mut self) {
+        if self.tree.toggle_collapse() {
+            self.tree.rebuild(&self.changes);
         }
     }
 
@@ -555,8 +605,15 @@ impl App {
             KeyCode::Enter => {
                 if let Some(item) = self.picker_state.selected().and_then(|i| self.picker_items.get(i)) {
                     let reff = item.reff.clone();
+                    // Clear all per-file view state so the status bar and
+                    // n/N navigation can't act on ghosts of the old baseline
+                    // while the new scan is in flight.
                     self.current_path = None;
                     self.prepared = None;
+                    self.hunk_offsets.clear();
+                    self.diff_total_rows = 0;
+                    self.current_hunk = 0;
+                    self.diff_scroll = 0;
                     self.send(Req::SetBaseline(reff));
                 }
                 self.overlay = Overlay::None;
@@ -598,4 +655,15 @@ impl App {
     pub fn hunk_count(&self) -> usize {
         self.hunk_offsets.len()
     }
+}
+
+/// Build the gitignore matcher used to filter fs events. Only the root
+/// `.gitignore` and `.git/info/exclude` are loaded; that is enough to drop
+/// the high-volume churn (build dirs) without risking false skips for the
+/// common layout.
+fn build_fs_ignore(root: &Path) -> Option<Gitignore> {
+    let mut builder = GitignoreBuilder::new(root);
+    builder.add(root.join(".gitignore"));
+    builder.add(root.join(".git").join("info").join("exclude"));
+    builder.build().ok()
 }

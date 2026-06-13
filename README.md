@@ -88,6 +88,14 @@ git repositories, where `.gitignore` files are still honored. `.git/` and
 `.snapshots/.gitignore` so it can never be committed accidentally. Dotfiles are
 *not* hidden, so changes to e.g. `.gitignore` or `.github/` are visible.
 
+Files tracked by **Git LFS** (anything matched by a `filter=lfs` rule in the
+repo-root `.gitattributes`) are also excluded, from both snapshots and diffs.
+HEAD stores only a small LFS *pointer* for these, so comparing it against the
+real working-tree file would report a change on every LFS file — exactly what
+`git status` does *not* show. Excluding them by the attribute rule (rather than
+by detecting a committed pointer) also hides brand-new LFS files that have not
+been committed yet. Nested per-directory `.gitattributes` are not consulted.
+
 ## Configuration (optional)
 
 diffobserver runs with no configuration. To customize, create
@@ -113,7 +121,9 @@ syntax_highlight = true
 - **Added** files show as all-insertions; **deleted** files as all-deletions.
 - **Binary** files (NUL byte detected) are listed but show a placeholder instead
   of a content diff.
-- **Large** files over the size cap are listed but not diffed.
+- **Large** files over the size cap are listed but not diffed; an unchanged one
+  is not listed at all (sizes equal on both sides ⇒ treated as unchanged,
+  since the content is never read).
 - **Unreadable** files (permission denied) are listed with a placeholder; one
   bad file never breaks the rest of the scan.
 - **Symlinks** are ignored entirely: not diffed and not snapshotted (unlike

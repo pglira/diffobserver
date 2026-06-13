@@ -154,7 +154,8 @@ pub fn save(root: &Path, name: &str) -> Result<()> {
 /// whole premise is a tree that is actively changing.
 fn copy_tree(root: &Path, dest: &Path, prev: Option<&Path>) -> Result<()> {
     std::fs::create_dir_all(dest)?;
-    for rel in excludes::walk_live(root)? {
+    let lfs = excludes::LfsMatcher::build(root);
+    for rel in excludes::walk_live(root, &lfs)? {
         let src = root.join(&rel);
         let target = dest.join(&rel);
         if let Some(parent) = target.parent() {

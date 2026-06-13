@@ -45,14 +45,33 @@ pub fn scan(
     base: &dyn BaselineSource,
     cfg: &ScanConfig,
 ) -> Result<Vec<FileChange>> {
-    let live: BTreeSet<PathBuf> = excludes::walk_live(root)?.into_iter().collect();
-    let base_paths: BTreeSet<PathBuf> = base.paths()?.into_iter().collect();
+    // Git LFS files are excluded from both sides: the baseline holds only a
+    // small pointer, never the real content, so any byte comparison is bogus.
+    // Filtering the baseline too (not just the live walk) keeps an unchanged
+    // LFS file from flipping to a spurious "Added".
+    let lfs = excludes::LfsMatcher::build(root);
+    let live: BTreeSet<PathBuf> = excludes::walk_live(root, &lfs)?.into_iter().collect();
+    let base_paths: BTreeSet<PathBuf> = base
+        .paths()?
+        .into_iter()
+        .filter(|rel| !lfs.is_lfs(rel))
+        .collect();
 
     let mut changes = Vec::new();
     for rel in live.union(&base_paths) {
         let kind = match (base_paths.contains(rel), live.contains(rel)) {
             (false, true) => ChangeKind::Added,
-            (true, false) => ChangeKind::Deleted,
+            (true, false) => {
+                // In the baseline but absent from the live (ignore-filtered)
+                // walk. If the file is still on disk, `walk_live` skipped it for
+                // an ignore rule — it is tracked-but-gitignored, which git does
+                // not treat as a change (.gitignore applies only to untracked
+                // files). Only a path that is truly gone is a deletion.
+                if root.join(rel).exists() {
+                    continue;
+                }
+                ChangeKind::Deleted
+            }
             (true, true) => ChangeKind::Modified,
             (false, false) => continue,
         };
@@ -89,6 +108,15 @@ fn classify(
         .then(|| base.size(rel))
         .flatten();
     if live_len.is_some_and(|l| l > cfg.size_cap) || base_len.is_some_and(|l| l > cfg.size_cap) {
+        // A file over the cap is never read, so we can't diff its content. For
+        // a modify we can still avoid a false positive: when both sizes are
+        // known and identical, treat it as unchanged (a size-based quick-check,
+        // like the rsync semantics used elsewhere). The price is a genuine
+        // same-size edit to a >cap file going unreported. Differing sizes — or
+        // an add/delete — are real changes.
+        if kind == ChangeKind::Modified && live_len.is_some() && live_len == base_len {
+            return None;
+        }
         return Some(FileChange {
             path: rel.to_path_buf(),
             kind,
@@ -257,6 +285,9 @@ mod tests {
         fn content(&self, rel: &Path) -> Result<Option<Vec<u8>>> {
             Ok(self.0.get(rel).cloned())
         }
+        fn size(&self, rel: &Path) -> Option<u64> {
+            self.0.get(rel).map(|b| b.len() as u64)
+        }
         fn label(&self) -> &str {
             "test"
         }
@@ -306,6 +337,78 @@ mod tests {
         assert_eq!(by.get("b.txt"), Some(&ChangeKind::Added));
         assert_eq!(by.get("d.txt"), Some(&ChangeKind::Deleted));
         assert!(!by.contains_key("c.txt"), "unchanged file must be skipped");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn lfs_files_are_excluded_committed_and_new() {
+        let root = temp_root();
+        // `.gitattributes` marks *.bin as Git LFS.
+        write(
+            &root,
+            ".gitattributes",
+            "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        );
+        // Committed LFS file: the working tree holds the real binary while the
+        // baseline holds only the pointer, so the bytes differ — yet it must
+        // not be reported.
+        write(&root, "data.bin", "REAL BINARY CONTENT");
+        // A brand-new LFS file absent from the baseline must also stay hidden.
+        write(&root, "fresh.bin", "NEW BINARY");
+        write(&root, "keep.txt", "same\n");
+
+        let mut base = HashMap::new();
+        base.insert(
+            PathBuf::from(".gitattributes"),
+            b"*.bin filter=lfs diff=lfs merge=lfs -text\n".to_vec(),
+        );
+        base.insert(
+            PathBuf::from("data.bin"),
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:deadbeef\nsize 19\n".to_vec(),
+        );
+        base.insert(PathBuf::from("keep.txt"), b"same\n".to_vec());
+        let base = MapBaseline(base);
+
+        let changes = scan(&root, &base, &ScanConfig::default()).unwrap();
+        assert!(
+            changes.is_empty(),
+            "LFS files (committed or new) must be excluded: {changes:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tracked_but_gitignored_file_on_disk_is_not_a_deletion() {
+        let root = temp_root();
+        write(&root, ".gitignore", "ignored/\n");
+        // Present on disk but gitignored, and in the baseline as a tracked-but-
+        // ignored file would be: git treats this as unchanged, not deleted.
+        write(&root, "ignored/keep.txt", "hi\n");
+        // `gone.txt` is in the baseline but truly absent from disk → a deletion.
+
+        let mut base = HashMap::new();
+        base.insert(PathBuf::from(".gitignore"), b"ignored/\n".to_vec());
+        base.insert(PathBuf::from("ignored/keep.txt"), b"hi\n".to_vec());
+        base.insert(PathBuf::from("gone.txt"), b"bye\n".to_vec());
+        let base = MapBaseline(base);
+
+        let changes = scan(&root, &base, &ScanConfig::default()).unwrap();
+        let by: HashMap<_, _> = changes
+            .iter()
+            .map(|c| (c.path.to_string_lossy().to_string(), c.kind))
+            .collect();
+
+        assert!(
+            !by.contains_key("ignored/keep.txt"),
+            "tracked-but-gitignored file still on disk must not be a deletion: {changes:?}"
+        );
+        assert_eq!(
+            by.get("gone.txt"),
+            Some(&ChangeKind::Deleted),
+            "a file truly removed from disk is still a deletion"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -374,6 +477,34 @@ mod tests {
         let fd = diff_file(&root, &base, Path::new("big.bin"), ChangeKind::Added, &cfg).unwrap();
         assert_eq!(fd.diff_kind, DiffKind::TooLarge);
         assert!(fd.hunks.is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn over_cap_modify_is_skipped_when_sizes_match() {
+        let root = temp_root();
+        let cfg = ScanConfig { size_cap: 1024 };
+
+        // Live and baseline both exceed the cap with identical size but
+        // different bytes: we won't read them, so it's taken as unchanged.
+        write(&root, "big.bin", &"x".repeat(4096));
+        let mut base = HashMap::new();
+        base.insert(PathBuf::from("big.bin"), vec![b'y'; 4096]);
+        let base = MapBaseline(base);
+
+        let changes = scan(&root, &base, &cfg).unwrap();
+        assert!(
+            changes.is_empty(),
+            "equal-size over-cap file must not be reported as modified: {changes:?}"
+        );
+
+        // Differing sizes are a real (if uncountable) change.
+        write(&root, "big.bin", &"x".repeat(5000));
+        let changes = scan(&root, &base, &cfg).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, ChangeKind::Modified);
+        assert_eq!(changes[0].diff_kind, DiffKind::TooLarge);
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -144,7 +144,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         removed,
         pos
     );
-    let bar = Style::default().fg(Color::Black).bg(Color::Cyan);
+    // White on the brand blue (#0074a6): high contrast on every terminal,
+    // and cohesive with the active-pane border. ANSI Black-on-Cyan washed
+    // out to an unreadable dark-on-bright combo on some themes.
+    let bar = Style::default().fg(Color::Rgb(255, 255, 255)).bg(ACTIVE_BORDER);
     f.render_widget(Paragraph::new(left).style(bar), area);
 
     // Expiry is handled by App::tick(); anything still present is shown.

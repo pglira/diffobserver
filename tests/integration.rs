@@ -98,6 +98,48 @@ fn git_head_baseline_detects_working_tree_changes() {
 }
 
 #[test]
+fn git_head_baseline_follows_new_commit() {
+    let root = temp_dir("githead-follow");
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.email", "t@example.com"]);
+    git(&root, &["config", "user.name", "Test"]);
+    write(&root, "file.txt", "one\n");
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "initial"]);
+
+    // No snapshots + a git repo => the baseline defaults to HEAD.
+    let (evt_tx, evt_rx) = mpsc::channel::<Event>();
+    let req_tx = worker::spawn(root.clone(), ScanConfig::default(), "base16-ocean.dark".into(), false, evt_tx.clone());
+    let mut app = App::new(root.clone(), true, Config::default(), req_tx.clone());
+    app.start();
+    pump(&mut app, &evt_rx, Duration::from_secs(3));
+
+    let label_before = app.baseline_label.clone();
+    assert!(label_before.starts_with("HEAD ("), "expected HEAD label, got {label_before:?}");
+
+    // Modify the working tree so there is a visible change against HEAD.
+    write(&root, "file.txt", "two\n");
+    app.on_event(Event::Fs(vec![root.join("file.txt")]));
+    pump(&mut app, &evt_rx, Duration::from_secs(3));
+    assert_eq!(app.changes.len(), 1, "modified file should diff against HEAD");
+
+    // Commit that change: HEAD now moves and the working tree matches it.
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "second"]);
+
+    // The .git write that a commit produces must re-resolve the HEAD baseline.
+    app.on_event(Event::Fs(vec![root.join(".git/logs/HEAD")]));
+    pump(&mut app, &evt_rx, Duration::from_secs(3));
+
+    assert_ne!(app.baseline_label, label_before, "HEAD label should follow the new commit");
+    assert!(app.baseline_label.starts_with("HEAD ("));
+    assert!(app.changes.is_empty(), "file now matches the new HEAD, so no diff remains");
+
+    let _ = req_tx.send(worker::Req::Shutdown);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn snapshot_then_edit_shows_in_diff() {
     let root = temp_dir("snap");
     write(&root, "src/main.rs", "fn main() {}\n");

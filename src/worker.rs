@@ -23,6 +23,9 @@ use crate::ui::highlight::Highlighter;
 /// Requests from the UI thread to the worker.
 pub enum Req {
     SetBaseline(BaselineRef),
+    /// HEAD may have moved (a `.git` ref/HEAD write was observed). Re-resolve
+    /// the HEAD baseline if one is being tracked, then rescan.
+    RefreshGitHead,
     Rescan,
     DiffFile {
         path: PathBuf,
@@ -90,7 +93,7 @@ fn run(
             }
             let superseded = pending
                 .iter()
-                .any(|r| matches!(r, Req::Rescan | Req::SetBaseline(_)));
+                .any(|r| matches!(r, Req::Rescan | Req::SetBaseline(_) | Req::RefreshGitHead));
             if superseded {
                 continue;
             }
@@ -109,6 +112,32 @@ fn run(
                 }
                 Err(e) => emit_err(&evt_tx, format!("baseline: {e:#}")),
             },
+            Req::RefreshGitHead => {
+                // Only meaningful while the baseline tracks HEAD. Re-resolve so
+                // the diff and the "HEAD (hash)" label follow new commits, but
+                // announce a new baseline only when HEAD actually moved. Always
+                // rescan: this also covers any working-tree change observed in
+                // the same fs batch (e.g. a checkout that rewrites files).
+                if matches!(current_ref, Some(BaselineRef::GitHead)) {
+                    match resolve(&root, &BaselineRef::GitHead) {
+                        Ok(b) => {
+                            let label = b.label().to_string();
+                            let moved = baseline
+                                .as_ref()
+                                .is_none_or(|cur| cur.label() != label.as_str());
+                            if moved {
+                                let _ = evt_tx.send(Event::Worker(Evt::BaselineSet {
+                                    label,
+                                    reff: BaselineRef::GitHead,
+                                }));
+                            }
+                            baseline = Some(b);
+                            scan_and_send(&root, baseline.as_deref(), &cfg, &evt_tx);
+                        }
+                        Err(e) => emit_err(&evt_tx, format!("baseline: {e:#}")),
+                    }
+                }
+            }
             Req::Rescan => scan_and_send(&root, baseline.as_deref(), &cfg, &evt_tx),
             Req::DiffFile { path, kind, arrival } => {
                 if let Some(b) = baseline.as_deref() {

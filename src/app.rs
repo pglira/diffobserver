@@ -243,9 +243,19 @@ impl App {
     fn handle_fs(&mut self, paths: Vec<PathBuf>) {
         let mut relevant = false;
         let mut gitignore_changed = false;
+        let mut git_head_changed = false;
         for p in &paths {
             let rel = p.strip_prefix(&self.root).unwrap_or(p);
-            if rel.starts_with(".git") || rel.starts_with(".snapshots") {
+            if rel.starts_with(".git") {
+                // A commit/checkout/reset moves HEAD; when the baseline tracks
+                // HEAD it must follow. Other .git churn (objects, index) is
+                // ignored so ordinary git activity doesn't re-resolve.
+                if self.baseline_ref == BaselineRef::GitHead && is_git_ref_change(rel) {
+                    git_head_changed = true;
+                }
+                continue;
+            }
+            if rel.starts_with(".snapshots") {
                 continue;
             }
             // Edits to ignore rules change what "ignored" means.
@@ -268,7 +278,11 @@ impl App {
         if gitignore_changed {
             self.fs_ignore = build_fs_ignore(&self.root);
         }
-        if relevant {
+        // A HEAD move re-resolves the baseline and rescans, so it subsumes a
+        // plain rescan for the same batch.
+        if git_head_changed {
+            self.send(Req::RefreshGitHead);
+        } else if relevant {
             self.send(Req::Rescan);
         }
     }
@@ -666,4 +680,51 @@ fn build_fs_ignore(root: &Path) -> Option<Gitignore> {
     builder.add(root.join(".gitignore"));
     builder.add(root.join(".git").join("info").join("exclude"));
     builder.build().ok()
+}
+
+/// True for `.git` paths whose write means HEAD may have moved: the `HEAD`
+/// file, any ref, `packed-refs`, or a reflog. Object and index writes are
+/// excluded so routine git activity doesn't re-resolve the HEAD baseline.
+fn is_git_ref_change(rel: &Path) -> bool {
+    let Ok(tail) = rel.strip_prefix(".git") else {
+        return false;
+    };
+    tail == Path::new("HEAD")
+        || tail == Path::new("packed-refs")
+        || tail.starts_with("refs")
+        || tail.starts_with("logs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_git_ref_change;
+    use std::path::Path;
+
+    #[test]
+    fn head_moves_are_detected() {
+        for p in [
+            ".git/HEAD",
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+            ".git/refs/tags/v1",
+            ".git/logs/HEAD",
+            ".git/logs/refs/heads/main",
+        ] {
+            assert!(is_git_ref_change(Path::new(p)), "{p} should count");
+        }
+    }
+
+    #[test]
+    fn other_git_and_tree_writes_are_ignored() {
+        for p in [
+            ".git",
+            ".git/index",
+            ".git/COMMIT_EDITMSG",
+            ".git/objects/ab/cdef",
+            ".gitignore",
+            "src/main.rs",
+        ] {
+            assert!(!is_git_ref_change(Path::new(p)), "{p} should not count");
+        }
+    }
 }

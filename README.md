@@ -135,6 +135,9 @@ syntax_highlight = true
   reserved.
 - Saving a snapshot only advances the baseline when you are already tracking
   `latest`; an explicitly chosen baseline (HEAD or an older snapshot) is kept.
+- When the baseline is git `HEAD`, it follows the repo: a new commit (or a
+  checkout/reset that moves HEAD) re-resolves the baseline and updates the
+  `HEAD (hash)` label automatically.
 
 ## Relationship to `snap.sh`
 

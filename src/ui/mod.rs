@@ -8,7 +8,7 @@ pub mod tree;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Focus, Overlay};
@@ -40,14 +40,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// Accent color for the active pane's border (#0074a6).
+const ACTIVE_BORDER: Color = Color::Rgb(0, 116, 166);
+
 fn pane_border(focused: bool) -> Style {
-    Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray })
+    Style::default().fg(if focused { ACTIVE_BORDER } else { Color::DarkGray })
+}
+
+/// The active pane gets a heavier (thicker) border to stand out.
+fn pane_border_type(focused: bool) -> BorderType {
+    if focused {
+        BorderType::Thick
+    } else {
+        BorderType::Plain
+    }
 }
 
 fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Tree && app.overlay == Overlay::None;
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(pane_border_type(focused))
         .border_style(pane_border(focused))
         .title(format!(" Changes ({}) ", app.changes.len()));
 
@@ -76,6 +89,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(pane_border_type(focused))
         .border_style(pane_border(focused))
         .title(title);
     let inner = block.inner(area);

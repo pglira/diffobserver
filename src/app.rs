@@ -87,6 +87,9 @@ pub struct App {
     pub prompt_input: String,
     pub picker_items: Vec<PickerItem>,
     pub picker_state: ListState,
+    /// While `Some(name)`, a delete of that snapshot is armed and one more
+    /// `d` confirms it; any other key cancels.
+    pub picker_pending_delete: Option<String>,
 
     /// Gitignore matcher used to drop fs events for ignored paths (e.g.
     /// `target/` churn during builds) before they trigger rescans.
@@ -138,6 +141,7 @@ impl App {
             prompt_input: String::new(),
             picker_items: Vec::new(),
             picker_state: ListState::default(),
+            picker_pending_delete: None,
             fs_ignore,
             palette,
             diff_area_height: 1,
@@ -574,7 +578,8 @@ impl App {
 
     // ---- baseline picker ----------------------------------------------------
 
-    fn open_picker(&mut self) {
+    /// Build the picker rows from the current snapshots plus a `HEAD` entry.
+    fn build_picker_items(&self) -> Vec<PickerItem> {
         let mut items = Vec::new();
         if let Ok(snaps) = snapshot::list(&self.root) {
             for s in snaps {
@@ -595,16 +600,89 @@ impl App {
                 reff: BaselineRef::GitHead,
             });
         }
+        items
+    }
+
+    fn selected_picker_item(&self) -> Option<&PickerItem> {
+        self.picker_state
+            .selected()
+            .and_then(|i| self.picker_items.get(i))
+    }
+
+    fn open_picker(&mut self) {
+        let items = self.build_picker_items();
         if items.is_empty() {
             self.toast("no snapshots yet — press S to take one");
             return;
         }
         self.picker_items = items;
         self.picker_state.select(Some(0));
+        self.picker_pending_delete = None;
         self.overlay = Overlay::Picker;
     }
 
+    /// The snapshot the baseline currently resolves to (the explicit one, or
+    /// the `latest` target while tracking it), or `None` when diffing HEAD.
+    fn active_snapshot_name(&self) -> Option<String> {
+        match &self.baseline_ref {
+            BaselineRef::Snapshot(n) => Some(n.clone()),
+            BaselineRef::Latest => snapshot::latest_name(&self.root),
+            BaselineRef::GitHead => None,
+        }
+    }
+
+    /// Handle `d` in the picker: arm a delete on the first press, perform it on
+    /// the second. The snapshot in use as the baseline is protected.
+    fn picker_delete(&mut self) {
+        let name = match self.selected_picker_item().map(|it| &it.reff) {
+            Some(BaselineRef::Snapshot(n)) => n.clone(),
+            _ => {
+                self.picker_pending_delete = None;
+                self.toast("only snapshots can be deleted");
+                return;
+            }
+        };
+        if self.active_snapshot_name().as_deref() == Some(name.as_str()) {
+            self.picker_pending_delete = None;
+            self.toast("can't delete the active baseline — switch first");
+            return;
+        }
+        if self.picker_pending_delete.as_deref() == Some(name.as_str()) {
+            self.picker_pending_delete = None;
+            match snapshot::delete(&self.root, &name) {
+                Ok(()) => {
+                    self.toast(format!("deleted snapshot: {name}"));
+                    self.refresh_picker_after_delete();
+                }
+                Err(e) => self.toast(format!("delete failed: {e:#}")),
+            }
+        } else {
+            // First press: arm; the picker shows a confirmation prompt.
+            self.picker_pending_delete = Some(name);
+        }
+    }
+
+    /// Rebuild the picker after a deletion, closing it if nothing is left.
+    fn refresh_picker_after_delete(&mut self) {
+        self.picker_items = self.build_picker_items();
+        if self.picker_items.is_empty() {
+            self.picker_state.select(None);
+            self.overlay = Overlay::None;
+            return;
+        }
+        let sel = self
+            .picker_state
+            .selected()
+            .unwrap_or(0)
+            .min(self.picker_items.len() - 1);
+        self.picker_state.select(Some(sel));
+    }
+
     fn key_picker(&mut self, key: KeyEvent) {
+        // Any keystroke other than a repeated `d` cancels a pending delete.
+        if key.code != KeyCode::Char('d') {
+            self.picker_pending_delete = None;
+        }
         let len = self.picker_items.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
@@ -616,8 +694,9 @@ impl App {
                 let i = self.picker_state.selected().unwrap_or(0).saturating_sub(1);
                 self.picker_state.select(Some(i));
             }
+            KeyCode::Char('d') => self.picker_delete(),
             KeyCode::Enter => {
-                if let Some(item) = self.picker_state.selected().and_then(|i| self.picker_items.get(i)) {
+                if let Some(item) = self.selected_picker_item() {
                     let reff = item.reff.clone();
                     // Clear all per-file view state so the status bar and
                     // n/N navigation can't act on ghosts of the old baseline

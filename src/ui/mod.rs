@@ -189,6 +189,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         help_line("Actions", ""),
         help_line("  S", "take a snapshot (name prompt)"),
         help_line("  s", "switch baseline (snapshots / HEAD)"),
+        help_line("  d", "delete highlighted snapshot (in the s menu)"),
         help_line("  e", "open $EDITOR at current change"),
         help_line("  r", "force refresh"),
         help_line("  w", "toggle unified / split view"),
@@ -244,10 +245,20 @@ fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) {
     let height = (app.picker_items.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
     let rect = centered_rect_abs(70, height, area);
     f.render_widget(Clear, rect);
+    let (title, border) = match &app.picker_pending_delete {
+        Some(name) => (
+            format!(" delete '{name}'?  d = confirm · any other key = cancel "),
+            Color::Red,
+        ),
+        None => (
+            " baseline — Enter select · d delete snapshot · Esc cancel ".to_string(),
+            Color::Cyan,
+        ),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" choose baseline (Enter to select, Esc to cancel) ");
+        .border_style(Style::default().fg(border))
+        .title(title);
     let items: Vec<ListItem> = app
         .picker_items
         .iter()

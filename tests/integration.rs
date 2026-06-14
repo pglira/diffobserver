@@ -179,6 +179,45 @@ fn key(app: &mut App, code: KeyCode) {
 }
 
 #[test]
+fn picker_deletes_inactive_snapshot_with_confirmation() {
+    let root = temp_dir("picker-del");
+    write(&root, "a.txt", "1\n");
+    snapshot::save(&root, "s1").unwrap();
+    write(&root, "a.txt", "2\n");
+    snapshot::save(&root, "s2").unwrap(); // newest => latest => the active baseline
+
+    let (evt_tx, evt_rx) = mpsc::channel::<Event>();
+    let req_tx = worker::spawn(root.clone(), ScanConfig::default(), "base16-ocean.dark".into(), false, evt_tx.clone());
+    let mut app = App::new(root.clone(), false, Config::default(), req_tx.clone());
+    app.start();
+    pump(&mut app, &evt_rx, Duration::from_secs(3));
+
+    // Open the picker; rows are newest-first: [s2 (latest/active), s1].
+    key(&mut app, KeyCode::Char('s'));
+
+    // The active baseline (s2) is protected even after a double-d.
+    key(&mut app, KeyCode::Char('d'));
+    key(&mut app, KeyCode::Char('d'));
+    assert!(snapshot::snapshot_path(&root, "s2").is_dir(), "active baseline must survive");
+
+    // Move to the inactive s1; one `d` only arms the confirmation.
+    key(&mut app, KeyCode::Char('j'));
+    key(&mut app, KeyCode::Char('d'));
+    assert!(snapshot::snapshot_path(&root, "s1").is_dir(), "single d must not delete");
+    assert_eq!(app.picker_pending_delete.as_deref(), Some("s1"));
+
+    // A second `d` confirms and removes it; latest is untouched.
+    key(&mut app, KeyCode::Char('d'));
+    assert!(!snapshot::snapshot_path(&root, "s1").is_dir(), "double d should delete s1");
+    assert!(snapshot::snapshot_path(&root, "s2").is_dir());
+    assert_eq!(snapshot::latest_name(&root).as_deref(), Some("s2"));
+    assert_eq!(app.picker_pending_delete, None);
+
+    let _ = req_tx.send(worker::Req::Shutdown);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn rescan_preserves_tree_selection_on_dir_row() {
     let root = temp_dir("yank");
     write(&root, "ui/mod.rs", "fn a() {}\n");

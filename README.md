@@ -72,6 +72,7 @@ moves to it.
 | `Esc` | return focus to the tree (from the diff) |
 | `S` | take a snapshot (prompts for a name) |
 | `s` | switch baseline (snapshots / `HEAD`) |
+| `d` | in the `s` menu: delete the highlighted snapshot (press twice to confirm) |
 | `e` | open `$EDITOR` at the current change |
 | `r` | force a refresh |
 | `w` | toggle unified / split view |

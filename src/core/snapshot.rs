@@ -139,13 +139,44 @@ pub fn save(root: &Path, name: &str) -> Result<()> {
         return Err(e);
     }
     std::fs::rename(&tmp, &dest).context("moving snapshot into place")?;
+    point_latest_at(&snap, name)?;
+    Ok(())
+}
 
-    // Repoint `latest` atomically via a temp symlink + rename.
+/// Atomically repoint `.snapshots/latest` at `name` via a temp symlink + rename.
+fn point_latest_at(snap: &Path, name: &str) -> Result<()> {
     let link = snap.join("latest");
     let tmp_link = snap.join(".latest.tmp");
     let _ = std::fs::remove_file(&tmp_link);
     symlink(name, &tmp_link).context("creating latest symlink")?;
     std::fs::rename(&tmp_link, &link).context("updating latest symlink")?;
+    Ok(())
+}
+
+/// Delete the snapshot `.snapshots/<name>`. If it was the `latest` target,
+/// repoint `latest` to the newest remaining snapshot, or remove the symlink
+/// when none remain. Fails if the snapshot does not exist.
+///
+/// Unchanged files are hard-linked across snapshots, so removing one only
+/// drops its links: the inodes survive in any other snapshot that shares them.
+pub fn delete(root: &Path, name: &str) -> Result<()> {
+    validate_name(name)?;
+    let snap = snapshots_dir(root);
+    let dir = snap.join(name);
+    if !dir.is_dir() {
+        anyhow::bail!("snapshot '{name}' not found");
+    }
+    std::fs::remove_dir_all(&dir).with_context(|| format!("removing snapshot '{name}'"))?;
+
+    // Repair the `latest` pointer if it referenced the just-deleted snapshot:
+    // repoint it to the newest remaining snapshot, or drop it if none remain.
+    if latest_name(root).as_deref() == Some(name) {
+        let _ = std::fs::remove_file(snap.join("latest"));
+        // `list` is newest-first, so the first remaining entry is the newest.
+        if let Some(next) = list(root)?.into_iter().next() {
+            point_latest_at(&snap, &next.name)?;
+        }
+    }
     Ok(())
 }
 
@@ -332,6 +363,58 @@ mod tests {
         .unwrap();
         save(&root, "s1").unwrap();
         assert_eq!(latest_name(&root).as_deref(), Some("s1"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_removes_snapshot_repoints_latest_and_keeps_shared_inodes() {
+        let root = temp_root();
+        std::fs::write(root.join("a.txt"), "A1").unwrap();
+        save(&root, "s1").unwrap();
+        std::fs::write(root.join("b.txt"), "B1").unwrap();
+        save(&root, "s2").unwrap();
+        std::fs::write(root.join("a.txt"), "A3-longer").unwrap();
+        save(&root, "s3").unwrap();
+        assert_eq!(latest_name(&root).as_deref(), Some("s3"));
+
+        // Deleting a non-latest snapshot leaves `latest` untouched. b.txt is
+        // shared (hard-linked) with s3; deleting s2 must not break that copy.
+        delete(&root, "s2").unwrap();
+        assert!(!snapshot_path(&root, "s2").exists());
+        assert_eq!(latest_name(&root).as_deref(), Some("s3"));
+        assert_eq!(list(&root).unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(snapshot_path(&root, "s3").join("b.txt")).unwrap(), "B1");
+
+        // Deleting the latest repoints it to the only remaining snapshot, s1,
+        // whose hard-linked a.txt survives s3's removal.
+        delete(&root, "s3").unwrap();
+        assert!(!snapshot_path(&root, "s3").exists());
+        assert_eq!(latest_name(&root).as_deref(), Some("s1"));
+        assert!(latest_dir(&root).is_some());
+        assert_eq!(std::fs::read_to_string(snapshot_path(&root, "s1").join("a.txt")).unwrap(), "A1");
+
+        // Deleting the last snapshot drops the `latest` pointer entirely.
+        delete(&root, "s1").unwrap();
+        assert!(list(&root).unwrap().is_empty());
+        assert!(latest_name(&root).is_none());
+        assert!(latest_dir(&root).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_rejects_missing_and_reserved_names() {
+        let root = temp_root();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        save(&root, "keep").unwrap();
+
+        for bad in ["nope", "latest", "", ".hidden", "a/b"] {
+            assert!(delete(&root, bad).is_err(), "delete {bad:?} must fail");
+        }
+        // The store and its one snapshot are untouched.
+        assert_eq!(list(&root).unwrap().len(), 1);
+        assert_eq!(latest_name(&root).as_deref(), Some("keep"));
 
         std::fs::remove_dir_all(&root).ok();
     }

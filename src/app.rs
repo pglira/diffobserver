@@ -364,7 +364,6 @@ impl App {
                 self.toast("refreshing…");
             }
             KeyCode::Char('w') => self.toggle_split(),
-            KeyCode::Char('e') => self.launch_editor(),
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Tree => Focus::Diff,
@@ -399,6 +398,10 @@ impl App {
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 match self.tree.selected_row().map(|r| (r.is_dir(), r.path.clone())) {
                     Some((true, _)) => self.collapse_selected(),
+                    // Enter opens the highlighted file in $EDITOR (the diff
+                    // already tracks it via j/k); l/→ show the diff and focus
+                    // the diff pane instead.
+                    Some((false, _)) if key.code == KeyCode::Enter => self.launch_editor(),
                     Some((false, p)) => {
                         self.request_diff(p, Arrival::Fresh);
                         self.focus = Focus::Diff;
@@ -448,6 +451,7 @@ impl App {
                 self.diff_scroll = self.diff_total_rows;
                 self.clamp_scroll();
             }
+            KeyCode::Enter => self.launch_editor(),
             KeyCode::Esc => self.focus = Focus::Tree,
             _ => {}
         }

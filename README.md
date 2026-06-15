@@ -62,7 +62,8 @@ moves to it.
 | --- | --- |
 | `j` / `k`, `↑` / `↓` | move selection (tree) / scroll (diff) |
 | `Tab` | switch focus between tree and diff |
-| `Enter` / `l` | open file / expand directory |
+| `Enter` | open the current file in `$EDITOR` (from the tree or the diff pane) |
+| `l` / `→` | show diff & focus the diff pane / expand directory |
 | `h` | collapse directory |
 | `]` / `[` | next / previous file |
 | `n` / `N` | next / previous change (crosses file boundaries) |
@@ -73,7 +74,6 @@ moves to it.
 | `S` | take a snapshot (prompts for a name) |
 | `s` | switch baseline (snapshots / `HEAD`) |
 | `d` | in the `s` menu: delete the highlighted snapshot (press twice to confirm) |
-| `e` | open `$EDITOR` at the current change |
 | `r` | force a refresh |
 | `w` | toggle unified / split view |
 | `<` / `>` | narrow / widen the tree pane |
